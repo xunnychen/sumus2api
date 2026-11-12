@@ -290,6 +290,24 @@ POST /api/app/sessions/{sid}/messages
 
 注意第一步的 `size` 必须与实际上传字节数一致，否则上游会拒。
 
+### Anthropic 格式（`/v1/messages`）
+
+同一个网关也接受 Anthropic Messages 格式，Claude Code、Anthropic SDK 填上地址和 key 就能连：
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:7864 ANTHROPIC_AUTH_TOKEN=<网关 api_key> claude
+```
+
+- 鉴权：`Authorization: Bearer <key>` 或 `x-api-key: <key>` 都行。
+- 支持流式与非流式。等上游回复时每 10 秒发一次 `ping`，防止客户端判超时。
+- 模型名自动映射：`claude-sonnet-5-5` → `anthropic/claude-sonnet-5.5`，日期后缀和 `[1m]` 之类的标签会去掉；带 `/` 的名字原样透传。
+- 内容块：`text`、`image`（base64 / url）、`document`（base64 PDF、纯文本）会转过去；`tool_use`、`thinking` 跳过。
+- Claude Code 塞进用户消息的内部记录（`<system-reminder>`、`/model` 这类本地命令的记录和输出）整块过滤，不发给上游。
+- `max_tokens: 1` 的请求（Claude Code 启动时用它探测额度）由网关直接应答，不花积分。
+- `/v1/messages/count_tokens` 按字数粗估，不调上游。响应里的 `usage` 也是估算值，上游不返回真实用量。
+
+**限制**：和 OpenAI 接口一样，上游只收到最后一条用户消息的文字和附件，`system`、`tools`、`tool_result` 都不会传给 Sumus，模型不会发起工具调用。Claude Code 接上以后能对话，但读写文件、跑命令都用不了；它说的「当前目录」是 Sumus 云端沙箱里的，不是本机。
+
 ## 可用模型
 
 21 个（实时从 `/api/app/models` 拉取，走 OpenRouter 上游）：
@@ -350,6 +368,8 @@ inception/mercury-3
 | `/status` | 是 | 账号池详情（JSON，供脚本用） |
 | `/v1/models` | 是 | OpenAI 格式模型列表 |
 | `/v1/chat/completions` | 是 | OpenAI 格式对话接口（支持多模态附件，见「文件与图片输入」） |
+| `/v1/messages` | 是 | Anthropic 格式对话接口（见「Anthropic 格式」） |
+| `/v1/messages/count_tokens` | 是 | 估算输入 token 数，不调上游 |
 
 ### 账号池管理面板
 

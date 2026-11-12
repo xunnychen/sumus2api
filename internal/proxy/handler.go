@@ -56,6 +56,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 因为浏览器无法自定义 Authorization 头（面板需据此在设了 key 时也能用）。
 	if h.cfg.APIKey != "" {
 		if !h.authorized(r) {
+			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+				writeAnthropicError(w, http.StatusUnauthorized, "无效的 API key")
+				return
+			}
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "无效的 API key")
 			return
 		}
@@ -64,6 +68,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/chat/completions":
 		h.handleChatCompletions(w, r)
+	case "/v1/messages":
+		h.handleMessages(w, r)
+	case "/v1/messages/count_tokens":
+		h.handleCountTokens(w, r)
 	case "/v1/models":
 		h.handleModels(w, r)
 	case "/status":
@@ -79,10 +87,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // authorized 校验请求是否携带正确的凭据。
-// 优先看 Authorization 头，其次看 ?key=（仅对 /admin/api/* 开放）。
+// 优先看 Authorization 头，再看 x-api-key（Anthropic SDK / Claude Code 用 ANTHROPIC_API_KEY 时发这个），
+// 最后看 ?key=（仅对 /admin/api/* 开放）。
 func (h *Handler) authorized(r *http.Request) bool {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if token != "" && token == h.cfg.APIKey {
+		return true
+	}
+	if k := r.Header.Get("X-Api-Key"); k != "" && k == h.cfg.APIKey {
 		return true
 	}
 	if strings.HasPrefix(r.URL.Path, "/admin/api/") {
@@ -207,17 +219,61 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		convKey = deriveConvKey(req.Messages)
 	}
 
-	// 选号
+	job, aerr := h.prepareChat(req, convKey, start)
+	if aerr != nil {
+		writeOpenAIError(w, aerr.Status, aerr.Code, aerr.Message)
+		return
+	}
+	defer job.Release()
+
+	text, msgID, aerr := h.runChat(r.Context(), job)
+	if aerr != nil {
+		writeOpenAIError(w, aerr.Status, aerr.Code, aerr.Message)
+		return
+	}
+
+	if req.Stream {
+		h.writeStream(w, req.Model, text, msgID)
+		return
+	}
+	h.writeNonStream(w, req.Model, text, msgID)
+}
+
+// apiError 是对话核心流程的失败结果，由各协议的 handler 转成自己的错误格式。
+type apiError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+// chatJob 是已选好账号、占好在途槽位的一次对话。调用方用完必须 Release。
+type chatJob struct {
+	convKey string
+	cred    *account.Cred
+	req     chatRequest
+	start   time.Time
+}
+
+// Release 归还在途槽位。
+func (j *chatJob) Release() { j.cred.Release() }
+
+// prepareChat 选号并占在途槽位。OpenAI 与 Anthropic 两个接口共用。
+// 单独拆出来是为了让流式接口先确认有号可用，再开始写 SSE 头。
+func (h *Handler) prepareChat(req chatRequest, convKey string, start time.Time) (*chatJob, *apiError) {
 	cred, err := h.pool.Pick(convKey)
 	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no_account", err.Error())
-		return
+		return nil, &apiError{http.StatusServiceUnavailable, "no_account", err.Error()}
 	}
 	if !cred.Acquire(h.cfg.Pool.MaxInFlight) {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "account_busy", "账号在途已满")
-		return
+		return nil, &apiError{http.StatusServiceUnavailable, "account_busy", "账号在途已满"}
 	}
-	defer cred.Release()
+	return &chatJob{convKey: convKey, cred: cred, req: req, start: start}, nil
+}
+
+// runChat 上传附件、发消息、轮询回复，并记下会话绑定与存档。
+// 返回回复文本与上游消息 ID。
+func (h *Handler) runChat(parent context.Context, job *chatJob) (string, string, *apiError) {
+	req, cred, convKey, start := job.req, job.cred, job.convKey, job.start
 
 	// 组装上游消息，同时把消息里引用的文件收出来
 	msgs := make([]upstream.Message, 0, len(req.Messages))
@@ -234,15 +290,14 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		sessionID = cred.AgentID
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.cfg.Upstream.PollTimeoutSeconds)*time.Second)
+	ctx, cancel := context.WithTimeout(parent, time.Duration(h.cfg.Upstream.PollTimeoutSeconds)*time.Second)
 	defer cancel()
 
 	// 上传附件（如果有）。上传走同一个 ctx，失败则整轮失败——
 	// 半截附件比没有附件更糟。
 	attachmentIDs, err := h.uploadAttachments(ctx, cred, pendingFiles)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "upload_failed", "附件上传失败: "+err.Error())
-		return
+		return "", "", &apiError{http.StatusBadGateway, "upload_failed", "附件上传失败: " + err.Error()}
 	}
 
 	out, err := h.client.Chat(ctx, cred, cred.WorkspaceID, upstream.ChatInput{
@@ -262,12 +317,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			cred.Unlock()
 			h.pool.Unbind(convKey)
 			h.saveTranscript(convKey, cred, req, "", nil, time.Since(start), "unauthorized: cookie expired")
-			writeOpenAIError(w, http.StatusUnauthorized, "unauthorized", "Sumus 凭证已过期，需要重新登录")
-			return
+			return "", "", &apiError{http.StatusUnauthorized, "unauthorized", "Sumus 凭证已过期，需要重新登录"}
 		}
 		h.saveTranscript(convKey, cred, req, "", nil, time.Since(start), err.Error())
-		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
-		return
+		return "", "", &apiError{http.StatusBadGateway, "upstream_error", err.Error()}
 	}
 
 	// 记住会话与绑定
@@ -281,12 +334,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	// 异步存档：不阻塞响应，失败也不影响主流程
 	h.saveTranscript(convKey, cred, req, text, out, time.Since(start), "")
-
-	if req.Stream {
-		h.writeStream(w, req.Model, text, out.Message.ID)
-		return
-	}
-	h.writeNonStream(w, req.Model, text, out.Message.ID)
+	return text, out.Message.ID, nil
 }
 
 // uploadAttachments 把消息里引用的文件上传到 Sumus，返回文件 ID 列表。
@@ -583,11 +631,19 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	data := make([]map[string]any, 0, len(models))
 	for _, m := range models {
+		name := m.Name
+		if name == "" {
+			name = m.ID
+		}
+		// 前四个字段是 OpenAI 格式，后三个是 Anthropic 格式；两种客户端各取所需。
 		data = append(data, map[string]any{
-			"id":       m.ID,
-			"object":   "model",
-			"created":  time.Now().Unix(),
-			"owned_by": m.Provider,
+			"id":           m.ID,
+			"object":       "model",
+			"created":      time.Now().Unix(),
+			"owned_by":     m.Provider,
+			"type":         "model",
+			"display_name": name,
+			"created_at":   time.Now().UTC().Format(time.RFC3339),
 		})
 	}
 	if data == nil {
@@ -596,8 +652,9 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"object": "list",
-		"data":   data,
+		"object":   "list",
+		"data":     data,
+		"has_more": false,
 	})
 }
 
